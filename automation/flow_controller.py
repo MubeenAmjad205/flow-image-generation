@@ -151,6 +151,41 @@ class FlowController:
 
         self.page.wait_for_timeout(1000)
 
+    def _get_media_image_sources(self) -> List[str]:
+        """Extracts valid generated image asset URLs across img tags, SVG images, and CSS background-images."""
+        try:
+            return self.page.evaluate(r"""() => {
+                const urls = new Set();
+                // 1. Standard img tags
+                document.querySelectorAll('img').forEach(e => {
+                    if (e.src) urls.add(e.src);
+                });
+                // 2. SVG image elements
+                document.querySelectorAll('image').forEach(e => {
+                    const href = e.getAttribute('href') || e.getAttribute('xlink:href');
+                    if (href) urls.add(href);
+                });
+                // 3. Background image styles
+                document.querySelectorAll('*').forEach(e => {
+                    try {
+                        const bg = window.getComputedStyle(e).backgroundImage;
+                        if (bg && bg.includes('url(')) {
+                            const match = bg.match(/url\(["']?(.*?)["']?\)/);
+                            if (match && match[1]) urls.add(match[1]);
+                        }
+                    } catch (err) {}
+                });
+
+                return [...urls].filter(src => {
+                    if (!src) return false;
+                    if (src.includes('/ogw/') || src.includes('avatar') || src.includes('favicon')) return false;
+                    return src.startsWith('blob:') || (src.includes('googleusercontent') && !src.includes('/ogw/'));
+                });
+            }""")
+        except Exception as err:
+            logger.debug(f"Media extraction error: {err}")
+            return []
+
     def generate_single_prompt(self, prompt_text: str, target_output_path: Path, timeout_sec: int = 90) -> bool:
         """Injects prompt text into ProseMirror contenteditable editor, submits generation, and saves asset."""
         logger.info(f"FlowController: Submitting prompt (Len: {len(prompt_text)})...")
@@ -158,11 +193,7 @@ class FlowController:
         # Snapshot existing image URLs on page before submitting
         initial_sources = set()
         try:
-            initial_sources = set(self.page.evaluate("""() => 
-                [...document.querySelectorAll('img')]
-                    .map(e => e.src)
-                    .filter(s => s && (s.includes('blob:') || s.includes('googleusercontent')))
-            """))
+            initial_sources = set(self._get_media_image_sources())
         except Exception:
             pass
 
@@ -213,7 +244,7 @@ class FlowController:
             prompt_box.press("Enter")
 
         logger.info("FlowController: Waiting for image generation completion...")
-        self.page.wait_for_timeout(10000)
+        self.page.wait_for_timeout(5000)
 
         start_time = time.time()
         target_img_src = None
@@ -239,17 +270,13 @@ class FlowController:
                 pass
 
             try:
-                current_sources = self.page.evaluate("""() => 
-                    [...document.querySelectorAll('img')]
-                        .map(e => e.src)
-                        .filter(s => s && (s.includes('blob:') || s.includes('googleusercontent')))
-                """)
+                current_sources = self._get_media_image_sources()
                 new_imgs = [s for s in current_sources if s not in initial_sources]
 
                 is_loading = False
                 try:
                     loader = self.page.locator("button:has(i:has-text('stop')), .mat-mdc-progress-spinner, [role='progressbar']")
-                    is_loading = loader.is_visible(timeout=500)
+                    is_loading = loader.is_visible(timeout=300)
                 except Exception:
                     pass
 
@@ -258,7 +285,6 @@ class FlowController:
                     logger.info(f"FlowController: Generation finished! Captured asset src: {target_img_src[:60]}...")
                     break
                 elif not initial_sources and current_sources and not is_loading:
-                    # Initial prompt case
                     target_img_src = current_sources[-1]
                     logger.info(f"FlowController: Generation finished! Captured asset src: {target_img_src[:60]}...")
                     break
@@ -339,35 +365,41 @@ class FlowController:
         """Submits multiple quoted prompts in a single batch to trigger parallel generation."""
         logger.info(f"FlowController: Submitting batch of {len(prompts)} prompts...")
 
-        # Combine prompts as quoted blocks separated by newlines
         combined_text = "\n\n".join([f'"{p.strip()}"' for p in prompts])
 
         initial_sources = set()
         try:
-            initial_sources = set(self.page.evaluate("""() => 
-                [...document.querySelectorAll('img')]
-                    .map(e => e.src)
-                    .filter(s => s && (s.includes('blob:') || s.includes('googleusercontent')))
-            """))
+            initial_sources = set(self._get_media_image_sources())
         except Exception:
             pass
 
         prompt_box = self.page.locator(".ProseMirror, [contenteditable='true']").first
         prompt_box.wait_for(state="visible", timeout=15000)
         prompt_box.click()
+        prompt_box.focus()
 
         try:
-            prompt_box.fill(combined_text)
+            self.page.keyboard.press("Meta+A")
+            self.page.keyboard.press("Backspace")
         except Exception:
-            self.page.evaluate("""(text) => {
-                const el = document.querySelector('.ProseMirror') || document.querySelector('[contenteditable="true"]');
-                if (el) {
-                    el.innerText = text;
-                    el.dispatchEvent(new Event('input', { bubbles: true }));
-                }
-            }""", combined_text)
+            pass
 
-        self.page.wait_for_timeout(500)
+        try:
+            # keyboard.insert_text simulates direct paste/input in contenteditable, preserving newlines
+            self.page.keyboard.insert_text(combined_text)
+        except Exception:
+            try:
+                prompt_box.fill(combined_text)
+            except Exception:
+                self.page.evaluate("""(text) => {
+                    const el = document.querySelector('.ProseMirror') || document.querySelector('[contenteditable="true"]');
+                    if (el) {
+                        el.innerText = text;
+                        el.dispatchEvent(new Event('input', { bubbles: true }));
+                    }
+                }""", combined_text)
+
+        self.page.wait_for_timeout(1000)
 
         submitted = False
         submit_selectors = [
@@ -396,32 +428,35 @@ class FlowController:
             prompt_box.press("Enter")
 
         logger.info(f"FlowController: Waiting for batch generation of {len(prompts)} assets...")
-        self.page.wait_for_timeout(10000)
+        self.page.wait_for_timeout(5000)
 
         start_time = time.time()
         results = [False] * len(prompts)
 
         while time.time() - start_time < timeout_sec:
             try:
-                current_sources = self.page.evaluate("""() => 
-                    [...document.querySelectorAll('img')]
-                        .map(e => e.src)
-                        .filter(s => s && (s.includes('blob:') || s.includes('googleusercontent')))
-                """)
+                current_sources = self._get_media_image_sources()
                 new_imgs = [s for s in current_sources if s not in initial_sources]
 
                 is_loading = False
                 try:
                     loader = self.page.locator("button:has(i:has-text('stop')), .mat-mdc-progress-spinner, [role='progressbar']")
-                    is_loading = loader.is_visible(timeout=500)
+                    is_loading = loader.is_visible(timeout=300)
+                except Exception:
+                    pass
+
+                is_idle = False
+                try:
+                    submit_btn = self.page.locator("button:has(i:has-text('arrow_forward')):visible, button:has(i:has-text('send')):visible, button[type='submit']:visible").first
+                    is_idle = submit_btn.is_visible(timeout=300)
                 except Exception:
                     pass
 
                 if new_imgs:
-                    logger.info(f"FlowController: Batch progress -> {len(new_imgs)}/{len(prompts)} assets rendered (IsLoading={is_loading})")
+                    logger.info(f"FlowController: Batch progress -> {len(new_imgs)}/{len(prompts)} assets detected (IsLoading={is_loading}, IsIdle={is_idle})")
 
-                if (len(new_imgs) >= len(prompts)) or (new_imgs and not is_loading and (time.time() - start_time > 30)):
-                    logger.info(f"FlowController: Batch generation completed! Saving {len(new_imgs)} assets...")
+                if (len(new_imgs) >= len(prompts)) or (new_imgs and not is_loading and is_idle):
+                    logger.info(f"FlowController: Batch generation completed early! Saving {len(new_imgs)} assets after {int(time.time() - start_time)}s...")
                     for idx, target_path in enumerate(target_output_paths):
                         if idx < len(new_imgs):
                             results[idx] = self._save_image_src_to_path(new_imgs[idx], target_path)
@@ -429,15 +464,11 @@ class FlowController:
             except Exception:
                 pass
 
-            self.page.wait_for_timeout(4000)
+            self.page.wait_for_timeout(2000)
 
         if not any(results):
             try:
-                current_sources = self.page.evaluate("""() => 
-                    [...document.querySelectorAll('img')]
-                        .map(e => e.src)
-                        .filter(s => s && (s.includes('blob:') || s.includes('googleusercontent')))
-                """)
+                current_sources = self._get_media_image_sources()
                 new_imgs = [s for s in current_sources if s not in initial_sources]
                 if new_imgs:
                     logger.info(f"FlowController: Fallback saving {len(new_imgs)} batch assets...")
@@ -446,5 +477,11 @@ class FlowController:
                             results[idx] = self._save_image_src_to_path(new_imgs[idx], target_path)
             except Exception:
                 pass
+
+        # Fallback for any uncompleted prompt items in batch: execute single prompt generation sequentially
+        for idx, (p, target_path) in enumerate(zip(prompts, target_output_paths)):
+            if not results[idx] or not target_path.exists() or target_path.stat().st_size <= 5000:
+                logger.info(f"FlowController: Batch item #{idx+1} missing or invalid. Falling back to single prompt generation...")
+                results[idx] = self.generate_single_prompt(p, target_path)
 
         return results

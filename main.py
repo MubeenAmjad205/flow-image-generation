@@ -23,7 +23,9 @@ from automation.cookie_manager import CookieManager
 from utils.file_utils import FileUtils
 
 
-def run_pipeline(docx_path: str, headless: bool = False, resume: bool = True, use_cookies: bool = False, batch_size: int = 1) -> None:
+from typing import Optional
+
+def run_pipeline(docx_path: str, headless: bool = False, resume: bool = True, use_cookies: bool = False, batch_size: int = 1, limit: Optional[int] = None) -> None:
     """Executes the complete Google Flow image generation pipeline.
     
     Args:
@@ -32,6 +34,7 @@ def run_pipeline(docx_path: str, headless: bool = False, resume: bool = True, us
         resume: Whether to resume existing job checkpoint if present.
         use_cookies: Whether to force injection of cookies.json into context.
         batch_size: Number of prompts to submit per batch.
+        limit: Optional maximum number of prompts to process (useful for testing).
     """
     logger.info(f"=== STARTING GOOGLE FLOW IMAGE AUTOMATION PIPELINE ===")
     docx_file = Path(docx_path)
@@ -127,6 +130,9 @@ def run_pipeline(docx_path: str, headless: bool = False, resume: bool = True, us
     # PHASES 6 & 7: Batch Prompt Execution Loop
     # -------------------------------------------------------------------------
     prompts_list = normalized_payload["images"]
+    if limit and limit > 0:
+        logger.info(f"Limiting execution to first {limit} prompts for testing.")
+        prompts_list = prompts_list[:limit]
     total_prompts = len(prompts_list)
 
     if batch_size > 1:
@@ -134,9 +140,13 @@ def run_pipeline(docx_path: str, headless: bool = False, resume: bool = True, us
         pending_items = []
         for item in prompts_list:
             seq = item["sequence"]
+            prompt_text = item["prompt"]
+            fn = FileUtils.format_sequence_filename(seq, prompt_text)
+            target_path = images_output_dir / fn
+
             p_state = state_mgr._get_prompt(seq)
-            if p_state and p_state["status"] == "COMPLETED":
-                logger.info(f"Prompt #{seq}/{total_prompts} already COMPLETED. Skipping.")
+            if p_state and p_state["status"] == "COMPLETED" and target_path.exists() and target_path.stat().st_size > 5000:
+                logger.info(f"Prompt #{seq}/{total_prompts} already COMPLETED ({target_path.stat().st_size} bytes). Skipping.")
                 continue
             pending_items.append(item)
 
@@ -163,13 +173,13 @@ def run_pipeline(docx_path: str, headless: bool = False, resume: bool = True, us
             seq = item["sequence"]
             prompt_text = item["prompt"]
 
-            p_state = state_mgr._get_prompt(seq)
-            if p_state and p_state["status"] == "COMPLETED":
-                logger.info(f"Prompt #{seq}/{total_prompts} already COMPLETED. Skipping.")
-                continue
-
             filename = FileUtils.format_sequence_filename(seq, prompt_text)
             target_path = images_output_dir / filename
+
+            p_state = state_mgr._get_prompt(seq)
+            if p_state and p_state["status"] == "COMPLETED" and target_path.exists() and target_path.stat().st_size > 5000:
+                logger.info(f"Prompt #{seq}/{total_prompts} already COMPLETED ({target_path.stat().st_size} bytes). Skipping.")
+                continue
 
             state_mgr.mark_generating(seq)
             success = flow.generate_single_prompt(prompt_text, target_output_path=target_path)
@@ -216,6 +226,7 @@ def main():
     parser.add_argument("--no-resume", action="store_false", dest="resume", help="Do not resume existing checkpoint")
     parser.add_argument("--use-cookies", action="store_true", help="Force raw JSON cookie injection from cookies.json")
     parser.add_argument("--batch-size", "-b", type=int, default=1, help="Number of prompts to submit per batch (default: 1)")
+    parser.add_argument("--limit", "-l", type=int, default=None, help="Limit execution to first N prompts for testing")
 
     args = parser.parse_args()
     run_pipeline(
@@ -223,7 +234,8 @@ def main():
         headless=args.headless,
         resume=args.resume,
         use_cookies=args.use_cookies,
-        batch_size=args.batch_size
+        batch_size=args.batch_size,
+        limit=args.limit
     )
 
 
