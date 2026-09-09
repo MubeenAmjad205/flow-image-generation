@@ -7,6 +7,7 @@ async completion monitoring, and asset downloading.
 
 import time
 import re
+import base64
 from pathlib import Path
 from typing import Any
 from utils.logger import logger
@@ -151,60 +152,175 @@ class FlowController:
         self.page.wait_for_timeout(1000)
 
     def generate_single_prompt(self, prompt_text: str, target_output_path: Path, timeout_sec: int = 90) -> bool:
-        """Injects prompt text, submits generation, monitors completion, and saves asset."""
+        """Injects prompt text into ProseMirror contenteditable editor, submits generation, and saves asset."""
         logger.info(f"FlowController: Submitting prompt (Len: {len(prompt_text)})...")
 
-        # Exclude hidden reCAPTCHA textareas, target real prompt input box
-        prompt_box = self.page.get_by_placeholder("What do you want to create?").or_(
-            self.page.locator("textarea[placeholder*='create'], input[placeholder*='create']")
-        ).or_(
-            self.page.locator("textarea:not(.g-recaptcha-response)")
-        )
-        prompt_box.wait_for(state="visible", timeout=15000)
-        prompt_box.fill("")
-        prompt_box.fill(prompt_text)
+        # Snapshot existing image URLs on page before submitting
+        initial_sources = set()
+        try:
+            initial_sources = set(self.page.evaluate("""() => 
+                [...document.querySelectorAll('img')]
+                    .map(e => e.src)
+                    .filter(s => s && (s.includes('blob:') || s.includes('googleusercontent')))
+            """))
+        except Exception:
+            pass
 
-        submit_btn = self.page.locator("button[type='submit']").or_(
-            self.page.locator("button:has(i:has-text('arrow_forward'))")
-        )
-        submit_btn.wait_for(state="enabled", timeout=5000)
-        submit_btn.click()
+        # 1. Locate ProseMirror contenteditable editor
+        prompt_box = self.page.locator(".ProseMirror, [contenteditable='true']").first
+        prompt_box.wait_for(state="visible", timeout=15000)
+        prompt_box.click()
+
+        # Fill text via Playwright or JS evaluate to trigger ProseMirror input events cleanly
+        try:
+            prompt_box.fill(prompt_text)
+        except Exception:
+            self.page.evaluate("""(text) => {
+                const el = document.querySelector('.ProseMirror') || document.querySelector('[contenteditable="true"]');
+                if (el) {
+                    el.innerText = text;
+                    el.dispatchEvent(new Event('input', { bubbles: true }));
+                }
+            }""", prompt_text)
+
+        self.page.wait_for_timeout(500)
+
+        # 2. Click Submit / Generate button or fallback to pressing Enter
+        submitted = False
+        submit_selectors = [
+            "button:has(i:has-text('arrow_forward')):visible",
+            "button:has(i:has-text('arrow_upward')):visible",
+            "button:has(i:has-text('send')):visible",
+            "button[aria-label*='Submit']:visible",
+            "button[aria-label*='Generate']:visible",
+            "button.flow-button-primary:visible:not(.settings-trigger-button)",
+            "button[type='submit']:visible",
+        ]
+        
+        for selector in submit_selectors:
+            try:
+                btn = self.page.locator(selector).first
+                if btn.is_visible(timeout=1000):
+                    btn.click()
+                    submitted = True
+                    logger.info(f"FlowController: Clicked submit button matching '{selector}'.")
+                    break
+            except Exception:
+                continue
+
+        if not submitted:
+            logger.info("FlowController: No explicit visible submit button found; pressing Enter on prompt box...")
+            prompt_box.press("Enter")
 
         logger.info("FlowController: Waiting for image generation completion...")
-        start_time = time.time()
-        self.page.wait_for_timeout(2000)
+        self.page.wait_for_timeout(10000)
 
-        while time.time() - start_time < timeout_sec:
-            stop_btn_visible = False
+        start_time = time.time()
+        target_img_src = None
+
+        while time.time() - start_time < (timeout_sec - 10):
+            # Check for explicit failure card in Google Flow DOM
             try:
-                stop_btn = self.page.locator("button:has(i:has-text('stop'))")
-                stop_btn_visible = stop_btn.is_visible(timeout=500)
+                fail_card = self.page.locator(
+                    "text='Sorry, this image failed to generate.'"
+                ).or_(
+                    self.page.locator("text='Failed'").filter(has_text="not been charged")
+                )
+                if fail_card.is_visible(timeout=500):
+                    logger.error("FlowController: Google Flow reported generation failure: 'Sorry, this image failed to generate.'")
+                    try:
+                        trash_btn = self.page.locator("button:has(i:has-text('delete')), button:has(mat-icon:has-text('delete'))").first
+                        if trash_btn.is_visible(timeout=500):
+                            trash_btn.click()
+                    except Exception:
+                        pass
+                    return False
             except Exception:
                 pass
 
-            if not stop_btn_visible:
-                logger.info("FlowController: Generation finished! Collecting asset...")
-                break
+            try:
+                current_sources = self.page.evaluate("""() => 
+                    [...document.querySelectorAll('img')]
+                        .map(e => e.src)
+                        .filter(s => s && (s.includes('blob:') || s.includes('googleusercontent')))
+                """)
+                new_imgs = [s for s in current_sources if s not in initial_sources]
+
+                is_loading = False
+                try:
+                    loader = self.page.locator("button:has(i:has-text('stop')), .mat-mdc-progress-spinner, [role='progressbar']")
+                    is_loading = loader.is_visible(timeout=500)
+                except Exception:
+                    pass
+
+                if new_imgs and not is_loading:
+                    target_img_src = new_imgs[-1]
+                    logger.info(f"FlowController: Generation finished! Captured asset src: {target_img_src[:60]}...")
+                    break
+                elif not initial_sources and current_sources and not is_loading:
+                    # Initial prompt case
+                    target_img_src = current_sources[-1]
+                    logger.info(f"FlowController: Generation finished! Captured asset src: {target_img_src[:60]}...")
+                    break
+            except Exception:
+                pass
 
             self.page.wait_for_timeout(2000)
-        else:
+
+        if not target_img_src:
             logger.error(f"FlowController: Generation timed out after {timeout_sec} seconds.")
             return False
 
+        return self._save_image_src_to_path(target_img_src, target_output_path)
+
+    def _save_image_src_to_path(self, img_src: str, target_output_path: Path) -> bool:
+        """Downloads or extracts image data from URL or blob and writes cleanly to file."""
+        target_output_path.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            if img_src.startswith("blob:"):
+                logger.info("FlowController: Fetching image data from blob URL...")
+                b64_data = self.page.evaluate("""async (url) => {
+                    const resp = await fetch(url);
+                    const blob = await resp.blob();
+                    return new Promise((resolve, reject) => {
+                        const reader = new FileReader();
+                        reader.onload = () => resolve(reader.result);
+                        reader.onerror = reject;
+                        reader.readAsDataURL(blob);
+                    });
+                }""", img_src)
+
+                if b64_data and "," in b64_data:
+                    header, encoded = b64_data.split(",", 1)
+                    image_bytes = base64.b64decode(encoded)
+                    target_output_path.write_bytes(image_bytes)
+                    logger.info(f"FlowController: Successfully saved generated image ({len(image_bytes)} bytes) to '{target_output_path}'")
+                    return True
+            elif img_src.startswith("http"):
+                logger.info("FlowController: Downloading image from HTTP URL...")
+                response = self.page.request.get(img_src)
+                if response.ok:
+                    target_output_path.write_bytes(response.body())
+                    logger.info(f"FlowController: Successfully saved generated image ({len(response.body())} bytes) to '{target_output_path}'")
+                    return True
+        except Exception as err:
+            logger.error(f"FlowController: Direct image save failed for '{img_src[:60]}': {err}")
+
+        # Fallback context menu download attempt
         return self._download_latest_media_asset(target_output_path)
 
     def _download_latest_media_asset(self, target_output_path: Path) -> bool:
-        """Intercepts download for the latest media thumbnail card."""
+        """Fallback method: Intercepts download for the latest media thumbnail card."""
         target_output_path.parent.mkdir(parents=True, exist_ok=True)
         try:
             thumbnail = self.page.locator(".media-thumbnail-card, div[role='button']:has(img)").first
             if thumbnail.is_visible(timeout=3000):
                 thumbnail.click(button="right")
                 self.page.wait_for_timeout(500)
-                
+
                 with self.page.expect_download(timeout=15000) as download_info:
                     self.page.get_by_text("Download", exact=True).click()
-                
+
                 download = download_info.value
                 download.save_as(str(target_output_path))
                 logger.info(f"FlowController: Saved generated image to '{target_output_path}'")
@@ -212,14 +328,123 @@ class FlowController:
         except Exception as err:
             logger.warning(f"Context menu download fallback engaged: {err}")
 
-        try:
-            img_element = self.page.locator("img[src*='blob:'], img[src*='googleusercontent']").first
-            if img_element.is_visible(timeout=3000):
-                src = img_element.get_attribute("src")
-                if src and src.startswith("blob:"):
-                    logger.info("FlowController: Direct image blob link verified.")
-                    return True
-        except Exception as err:
-            logger.error(f"Failed to capture image asset: {err}")
-
         return False
+
+    def generate_batch_prompts(
+        self,
+        prompts: List[str],
+        target_output_paths: List[Path],
+        timeout_sec: int = 300
+    ) -> List[bool]:
+        """Submits multiple quoted prompts in a single batch to trigger parallel generation."""
+        logger.info(f"FlowController: Submitting batch of {len(prompts)} prompts...")
+
+        # Combine prompts as quoted blocks separated by newlines
+        combined_text = "\n\n".join([f'"{p.strip()}"' for p in prompts])
+
+        initial_sources = set()
+        try:
+            initial_sources = set(self.page.evaluate("""() => 
+                [...document.querySelectorAll('img')]
+                    .map(e => e.src)
+                    .filter(s => s && (s.includes('blob:') || s.includes('googleusercontent')))
+            """))
+        except Exception:
+            pass
+
+        prompt_box = self.page.locator(".ProseMirror, [contenteditable='true']").first
+        prompt_box.wait_for(state="visible", timeout=15000)
+        prompt_box.click()
+
+        try:
+            prompt_box.fill(combined_text)
+        except Exception:
+            self.page.evaluate("""(text) => {
+                const el = document.querySelector('.ProseMirror') || document.querySelector('[contenteditable="true"]');
+                if (el) {
+                    el.innerText = text;
+                    el.dispatchEvent(new Event('input', { bubbles: true }));
+                }
+            }""", combined_text)
+
+        self.page.wait_for_timeout(500)
+
+        submitted = False
+        submit_selectors = [
+            "button:has(i:has-text('arrow_forward')):visible",
+            "button:has(i:has-text('arrow_upward')):visible",
+            "button:has(i:has-text('send')):visible",
+            "button[aria-label*='Submit']:visible",
+            "button[aria-label*='Generate']:visible",
+            "button.flow-button-primary:visible:not(.settings-trigger-button)",
+            "button[type='submit']:visible",
+        ]
+
+        for selector in submit_selectors:
+            try:
+                btn = self.page.locator(selector).first
+                if btn.is_visible(timeout=1000):
+                    btn.click()
+                    submitted = True
+                    logger.info(f"FlowController: Clicked submit button matching '{selector}'.")
+                    break
+            except Exception:
+                continue
+
+        if not submitted:
+            logger.info("FlowController: Pressing Enter on prompt box for batch...")
+            prompt_box.press("Enter")
+
+        logger.info(f"FlowController: Waiting for batch generation of {len(prompts)} assets...")
+        self.page.wait_for_timeout(10000)
+
+        start_time = time.time()
+        results = [False] * len(prompts)
+
+        while time.time() - start_time < timeout_sec:
+            try:
+                current_sources = self.page.evaluate("""() => 
+                    [...document.querySelectorAll('img')]
+                        .map(e => e.src)
+                        .filter(s => s && (s.includes('blob:') || s.includes('googleusercontent')))
+                """)
+                new_imgs = [s for s in current_sources if s not in initial_sources]
+
+                is_loading = False
+                try:
+                    loader = self.page.locator("button:has(i:has-text('stop')), .mat-mdc-progress-spinner, [role='progressbar']")
+                    is_loading = loader.is_visible(timeout=500)
+                except Exception:
+                    pass
+
+                if new_imgs:
+                    logger.info(f"FlowController: Batch progress -> {len(new_imgs)}/{len(prompts)} assets rendered (IsLoading={is_loading})")
+
+                if (len(new_imgs) >= len(prompts)) or (new_imgs and not is_loading and (time.time() - start_time > 30)):
+                    logger.info(f"FlowController: Batch generation completed! Saving {len(new_imgs)} assets...")
+                    for idx, target_path in enumerate(target_output_paths):
+                        if idx < len(new_imgs):
+                            results[idx] = self._save_image_src_to_path(new_imgs[idx], target_path)
+                    break
+            except Exception:
+                pass
+
+            self.page.wait_for_timeout(4000)
+
+        if not any(results):
+            try:
+                current_sources = self.page.evaluate("""() => 
+                    [...document.querySelectorAll('img')]
+                        .map(e => e.src)
+                        .filter(s => s && (s.includes('blob:') || s.includes('googleusercontent')))
+                """)
+                new_imgs = [s for s in current_sources if s not in initial_sources]
+                if new_imgs:
+                    logger.info(f"FlowController: Fallback saving {len(new_imgs)} batch assets...")
+                    for idx, target_path in enumerate(target_output_paths):
+                        if idx < len(new_imgs):
+                            results[idx] = self._save_image_src_to_path(new_imgs[idx], target_path)
+            except Exception:
+                pass
+
+        return results
