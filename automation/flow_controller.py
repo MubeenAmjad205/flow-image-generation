@@ -96,6 +96,51 @@ class FlowController:
         logger.info(f"FlowController: Project workspace ready at '{project_url}'")
         return project_url
 
+    def ensure_agent_mode_off(self) -> None:
+        """Closes the Assistant Chat drawer ('Untitled session') and turns off Agent mode to force direct image generation."""
+        logger.info("FlowController: Checking for open Assistant session panel / Agent mode...")
+        try:
+            # 1. Close session drawer if open ('Untitled session')
+            session_closed = self.page.evaluate("""() => {
+                let closed = false;
+                const closeBtns = Array.from(document.querySelectorAll('button')).filter(b => {
+                    const text = (b.innerText || '').toLowerCase();
+                    const label = (b.getAttribute('aria-label') || '').toLowerCase();
+                    const icon = b.querySelector('i, mat-icon');
+                    const iconText = icon ? (icon.innerText || '').toLowerCase() : '';
+                    return text.includes('close') || label.includes('close') || iconText === 'close';
+                });
+                
+                // Find close button inside session header or right panel
+                for (const btn of closeBtns) {
+                    const parentText = (btn.closest('header, [role="complementary"], aside, .drawer') || {}).innerText || '';
+                    if (parentText.includes('session') || parentText.includes('Untitled') || parentText.includes('agent')) {
+                        btn.click();
+                        closed = true;
+                        break;
+                    }
+                }
+                return closed;
+            }""")
+            if session_closed:
+                logger.info("FlowController: Successfully closed Assistant session panel ('Untitled session').")
+                self.page.wait_for_timeout(1000)
+        except Exception as err:
+            logger.debug(f"Session panel close check: {err}")
+
+        # 2. Toggle off Agent Mode checkbox in settings drawer if visible
+        try:
+            agent_pattern = re.compile("Agent Mode", re.IGNORECASE)
+            agent_toggle = self.page.get_by_label(agent_pattern).or_(
+                self.page.locator("input[type='checkbox'][aria-label*='Agent']")
+            )
+            if agent_toggle.is_visible(timeout=1000) and agent_toggle.is_checked():
+                logger.info("FlowController: Toggling Agent Mode checkbox to OFF...")
+                agent_toggle.click()
+                self.page.wait_for_timeout(500)
+        except Exception as err:
+            logger.debug(f"Agent Mode toggle check: {err}")
+
     def configure_project(
         self,
         model: str = "nano_banana",
@@ -104,6 +149,9 @@ class FlowController:
     ) -> None:
         """Configures Agent Mode (OFF), Model (Nano Banana), and Aspect Ratio (16:9)."""
         logger.info(f"FlowController: Configuring settings -> Model: {model}, Ratio: {aspect_ratio}, Agent Mode: OFF")
+
+        if disable_agent_mode:
+            self.ensure_agent_mode_off()
 
         # Open Tune / Settings Drawer if tune button is visible
         try:
@@ -117,19 +165,8 @@ class FlowController:
         except Exception:
             pass
 
-        # 1. Disable Agent Mode if active
         if disable_agent_mode:
-            try:
-                agent_pattern = re.compile("Agent Mode", re.IGNORECASE)
-                agent_toggle = self.page.get_by_label(agent_pattern).or_(
-                    self.page.locator("input[type='checkbox'][aria-label*='Agent']")
-                )
-                if agent_toggle.is_visible(timeout=2000):
-                    if agent_toggle.is_checked():
-                        logger.info("FlowController: Toggling Agent Mode to OFF...")
-                        agent_toggle.click()
-            except Exception as err:
-                logger.debug(f"Agent Mode toggle check: {err}")
+            self.ensure_agent_mode_off()
 
         # 2. Select Model (Nano Banana)
         try:
