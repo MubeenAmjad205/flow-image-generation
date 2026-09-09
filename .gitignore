@@ -1,0 +1,21 @@
+# Environments & Python Cache
+.env
+.venv/
+env/
+venv/
+__pycache__/
+*.pyc
+
+# Project Runtime Directories & Logs (No workspace pollution)
+logs/
+output/
+jobs/
+tmp/
+profiles/
+*.storage.json
+*.log
+
+# IDE & OS Files
+.DS_Store
+.vscode/
+.idea/
